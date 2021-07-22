@@ -570,6 +570,40 @@ static int32_t getSmlMd5ChildTableName(TAOS_SML_DATA_POINT* point, char* tableNa
   return 0;
 }
 
+
+static int32_t changeChildTableTagsValue(TAOS* taos, const char* cTableName, SSchema* tagSchema, TAOS_BIND* bind) {
+  char sql[512];
+  sprintf(sql, "alter table %s set tag %s=?", cTableName, tagSchema->name);
+
+  int32_t code;
+  TAOS_STMT* stmt = taos_stmt_init(taos);
+  code = taos_stmt_prepare(stmt, sql, (unsigned long)strlen(sql));
+
+  if (code != 0) {
+    tscError("%s", taos_stmt_errstr(stmt));
+    return code;
+  }
+
+  code = taos_stmt_bind_param(stmt, bind);
+  if (code != 0) {
+    tscError("%s", taos_stmt_errstr(stmt));
+    return code;
+  }
+
+  code = taos_stmt_execute(stmt);
+  if (code != 0) {
+    tscError("%s", taos_stmt_errstr(stmt));
+    return code;
+  }
+
+  code = taos_stmt_close(stmt);
+  if (code != 0) {
+    tscError("%s", taos_stmt_errstr(stmt));
+    return code;
+  }
+  return code;
+}
+
 static int32_t creatChildTableIfNotExists(TAOS* taos, const char* cTableName, const char* sTableName, SArray* tagsSchema, SArray* tagsBind) {
   size_t numTags = taosArrayGetSize(tagsSchema);
   char* sql = malloc(tsMaxSQLStringLen+1);
@@ -742,6 +776,72 @@ static int32_t arrangePointsByChildTableName(TAOS_SML_DATA_POINT* points, int nu
   return 0;
 }
 
+static int32_t reconsileChildTable(TAOS* taos, char* cTableName, char* sTableName,
+                                   SSmlSTableSchema* sTableSchema, SArray* cTablePoints) {
+  int isNullColBind = TSDB_TRUE;
+
+  TAOS_SML_DATA_POINT * point = taosArrayGetP(cTablePoints, 0);
+
+  size_t numTags = taosArrayGetSize(sTableSchema->tags);
+  size_t numCols = taosArrayGetSize(sTableSchema->fields);
+  size_t rows = taosArrayGetSize(cTablePoints);
+
+  TAOS_SML_KV** tagKVs = calloc(numTags, sizeof(TAOS_SML_KV*));
+  for (int i= 0; i < rows; ++i) {
+    TAOS_SML_DATA_POINT * pDataPoint = taosArrayGetP(cTablePoints, i);
+    for (int j = 0; j < pDataPoint->tagNum; ++j) {
+      TAOS_SML_KV* kv = pDataPoint->tags + j;
+      tagKVs[kv->fieldSchemaIdx] = kv;
+    }
+  }
+
+  SArray* tagBinds = taosArrayInit(numTags, sizeof(TAOS_BIND));
+  taosArraySetSize(tagBinds, numTags);
+  for (int j = 0; j < numTags; ++j) {
+    TAOS_BIND* bind = taosArrayGet(tagBinds, j);
+    bind->is_null = &isNullColBind;
+  }
+  for (int j = 0; j < numTags; ++j) {
+    if (tagKVs[j] == NULL) continue;
+    TAOS_SML_KV* kv =  tagKVs[j];
+    TAOS_BIND* bind = taosArrayGet(tagBinds, kv->fieldSchemaIdx);
+    bind->buffer_type = kv->type;
+    bind->length = malloc(sizeof(uintptr_t*));
+    *bind->length = kv->length;
+    bind->buffer = kv->value;
+    bind->is_null = NULL;
+  }
+
+  // select tag1,tag2,... from stable where tbname in (ctable)
+  char sql[TSDB_MAX_BINARY_LEN];
+  int capacity = TSDB_MAX_BINARY_LEN;
+  snprintf(sql, capacity, "select tbname, ");
+  for (int i = 0; i < numTags ; ++i)  {
+    if (tagKVs == NULL) continue;
+    snprintf(sql + strlen(sql), capacity-strlen(sql), "%s,", tagKVs[i]->key);
+  }
+
+  snprintf(sql + strlen(sql) - 1, capacity - strlen(sql) + 1,
+           " from %s where tbname in (\'%s\')", sTableName, cTableName);
+  TAOS_RES* result = taos_query(taos, sql);
+  int32_t code = taos_errno(result);
+  if (code != 0) {
+    tscError("%s", taos_errstr(result));
+    taos_free_result(result);
+    goto cleanup;
+  }
+
+  // check tag value and set tag values if different
+  TAOS_ROW row;
+  int numFields = taos_field_count(result);
+  row = taos_fetch_row(result);
+  if (row != NULL) {
+
+  }
+cleanup:
+  return code;
+}
+
 static int32_t insertPoints(TAOS* taos, TAOS_SML_DATA_POINT* points, int32_t numPoints, SArray* stableSchemas) {
   int32_t code = TSDB_CODE_SUCCESS;
 
@@ -755,9 +855,20 @@ static int32_t insertPoints(TAOS* taos, TAOS_SML_DATA_POINT* points, int32_t num
     SArray* cTablePoints = *pCTablePoints;
 
     TAOS_SML_DATA_POINT * point = taosArrayGetP(cTablePoints, 0);
+
     SSmlSTableSchema* sTableSchema = taosArrayGet(stableSchemas, point->schemaIdx);
     size_t numTags = taosArrayGetSize(sTableSchema->tags);
     size_t numCols = taosArrayGetSize(sTableSchema->fields);
+    size_t rows = taosArrayGetSize(cTablePoints);
+
+    TAOS_SML_KV** tagKVs = calloc(numTags, sizeof(TAOS_SML_KV*));
+    for (int i= 0; i < rows; ++i) {
+      TAOS_SML_DATA_POINT * pDataPoint = taosArrayGetP(cTablePoints, i);
+      for (int j = 0; j < pDataPoint->tagNum; ++j) {
+        TAOS_SML_KV* kv = pDataPoint->tags + j;
+        tagKVs[kv->fieldSchemaIdx] = kv;
+      }
+    }
 
     SArray* tagBinds = taosArrayInit(numTags, sizeof(TAOS_BIND));
     taosArraySetSize(tagBinds, numTags);
@@ -765,8 +876,9 @@ static int32_t insertPoints(TAOS* taos, TAOS_SML_DATA_POINT* points, int32_t num
       TAOS_BIND* bind = taosArrayGet(tagBinds, j);
       bind->is_null = &isNullColBind;
     }
-    for (int j = 0; j < point->tagNum; ++j) {
-      TAOS_SML_KV* kv =  point->tags + j;
+    for (int j = 0; j < numTags; ++j) {
+      if (tagKVs[j] == NULL) continue;
+      TAOS_SML_KV* kv =  tagKVs[j];
       TAOS_BIND* bind = taosArrayGet(tagBinds, kv->fieldSchemaIdx);
       bind->buffer_type = kv->type;
       bind->length = malloc(sizeof(uintptr_t*));
@@ -775,7 +887,6 @@ static int32_t insertPoints(TAOS* taos, TAOS_SML_DATA_POINT* points, int32_t num
       bind->is_null = NULL;
     }
 
-    size_t rows = taosArrayGetSize(cTablePoints);
     SArray* rowsBind = taosArrayInit(rows, POINTER_BYTES);
 
     for (int i = 0; i < rows; ++i) {
@@ -817,6 +928,8 @@ static int32_t insertPoints(TAOS* taos, TAOS_SML_DATA_POINT* points, int32_t num
       free(bind->length);
     }
     taosArrayDestroy(tagBinds);
+    free(tagKVs);
+
     for (int i = 0; i < rows; ++i) {
       TAOS_BIND* colBinds = taosArrayGetP(rowsBind, i);
       for (int j = 0; j < numCols; ++j) {
